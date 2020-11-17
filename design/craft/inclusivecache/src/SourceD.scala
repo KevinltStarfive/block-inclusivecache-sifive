@@ -77,26 +77,60 @@ class SourceD(params: InclusiveCacheParameters) extends Module
   val s3_ready = Wire(Bool())
   val s4_ready = Wire(Bool())
 
-  ////////////////////////////////////// STAGE 1 //////////////////////////////////////
-  // Reform the request beats
-
+  /* STAGE 1
+   * Reform the request beats
+   */
   val busy = RegInit(Bool(false))
   val s1_block_r = RegInit(Bool(false))
   val s1_counter = RegInit(UInt(0, width = params.innerBeatBits))
   val s1_req_reg = RegEnable(io.req.bits, !busy && io.req.valid)
   val s1_req = Mux(!busy, io.req.bits, s1_req_reg)
+
+  /** For one beat read, there are several subbanks need to access.
+    * Each subbanks may be able to bypass at different stage.
+    * Here we detect if current read request can bypass data from write request at stage 2 to stage 4.
+    * If yes, at stage 3, the data can be fetched from stage 4 to stage 7.
+    */
   val s1_x_bypass = Wire(UInt(width = beatBytes/writeBytes)) // might go from high=>low during stall
+
+  /** Check if we are not busy and there is no outstanding request OR next stage is ready,
+    * buffer this result for later usage.
+    */
   val s1_latch_bypass = RegNext(!(busy || io.req.valid) || s2_ready)
+
+  /** Latch [[s1_x_bypass]] until [[s1_latch_bypass]]. */
   val s1_bypass = Mux(s1_latch_bypass, s1_x_bypass, RegEnable(s1_x_bypass, s1_latch_bypass))
   val s1_mask = MaskGen(s1_req.offset, s1_req.size, beatBytes, writeBytes) & ~s1_bypass
+
+  /** We only need to grant the privilege without return the cache-line data. */
   val s1_grant = (s1_req.opcode === AcquireBlock && s1_req.param === BtoT) || s1_req.opcode === AcquirePerm
+
+  /** If we need read from [[BankedStore]] */
   val s1_need_r = s1_mask.orR && s1_req.prio(0) && s1_req.opcode =/= Hint && !s1_grant &&
                   (s1_req.opcode =/= PutFullData || s1_req.size < UInt(log2Ceil(writeBytes)))
+
+  /** If we need to read AND we are not blocked by other read requests, then this stage is valid. */
   val s1_valid_r = (busy || io.req.valid) && s1_need_r && !s1_block_r
-  val s1_need_pb = Mux(s1_req.prio(0), !s1_req.opcode(2), s1_req.opcode(0)) // hasData
+
+  /** It indicates if the request contains data. The data will be fetched at next stage.
+    * If this request is from A channel:
+    * [[s1_req.opcode(2)]]: false.B => Put => [[s1_need_pb]] = true.B
+    *                       true.B => Get, AcquireBlock, AcquirePerm => [[s1_need_pb]] = false.B
+    * If the request is from C channel:
+    * [[s1_req.opcode(0)]]: false.B => Release
+    *                       true.B => ReleaseData
+    */
+  val s1_need_pb = Mux(s1_req.prio(0), !s1_req.opcode(2), s1_req.opcode(0))
+
+  /** If the response message only stands for one cycle. */
   val s1_single = Mux(s1_req.prio(0), s1_req.opcode === Hint || s1_grant, s1_req.opcode === Release)
-  val s1_retires = !s1_single // retire all operations with data in s3 for bypass (saves energy)
-  // Alternatively: val s1_retires = s1_need_pb // retire only updates for bypass (less backpressure from WB)
+
+  /** Retire all operations with data in s3 for bypass (saves energy).
+    * A read request can bypass data from stage 4 to stage 7 from previous writeback, i.e. ReleaseData/Put.
+    * This signal will flow down to stage 4 dedicating if it is a writeback so the data can be forward to other read requests.
+    */
+  val s1_retires = !s1_single
+  /* Alternatively: val s1_retires = s1_need_pb // retire only updates for bypass (less backpressure from WB) */
   val s1_beats1 = Mux(s1_single, UInt(0), UIntToOH1(s1_req.size, log2Up(params.cache.blockBytes)) >> log2Ceil(beatBytes))
   val s1_beat = (s1_req.offset >> log2Ceil(beatBytes)) | s1_counter
   val s1_last = s1_counter === s1_beats1
@@ -115,14 +149,17 @@ class SourceD(params: InclusiveCacheParameters) extends Module
 
   params.ccover(io.bs_radr.valid && !io.bs_radr.ready, "SOURCED_1_READ_STALL", "Data readout stalled")
 
-  // Make a queue to catch BS readout during stalls
+  /* Make a queue to catch BS readout during stalls */
   val queue = Module(new Queue(io.bs_rdat, 3, flow=true))
+
+  /* Wait for two cycles and buffer the result from BS */
   queue.io.enq.valid := RegNext(RegNext(io.bs_radr.fire()))
   queue.io.enq.bits := io.bs_rdat
   assert (!queue.io.enq.valid || queue.io.enq.ready)
 
   params.ccover(!queue.io.enq.ready, "SOURCED_1_QUEUE_FULL", "Filled SRAM skidpad queue completely")
 
+  /* If there is an outstanding read to [[BankedStore]], we need to block other reads. */
   when (io.bs_radr.fire()) { s1_block_r := Bool(true) }
   when (io.req.valid) { busy := Bool(true) }
   when (s1_valid && s2_ready) {
@@ -137,11 +174,17 @@ class SourceD(params: InclusiveCacheParameters) extends Module
   params.ccover(s1_valid && !s2_ready, "SOURCED_1_STALL", "Stage 1 pipeline blocked")
 
   io.req.ready := !busy
+
+  /* If stage one is valid depends on 1 AND 2:
+   *   1. We are busy OR there is outstanding request.
+   *   2. We are not issuing read request OR
+   *      if we issued a read request and there are available [[BankedStore]] resources.
+   */
   s1_valid := (busy || io.req.valid) && (!s1_valid_r || io.bs_radr.ready)
 
-  ////////////////////////////////////// STAGE 2 //////////////////////////////////////
-  // Fetch the request data
-
+  /* STAGE 2
+   * Fetch the request data from SinkA or SinkC if necessary.
+   */
   val s2_latch = s1_valid && s2_ready
   val s2_full = RegInit(Bool(false))
   val s2_valid_pb = RegInit(Bool(false))
@@ -156,6 +199,9 @@ class SourceD(params: InclusiveCacheParameters) extends Module
   val s2_pdata_raw = Wire(new PutBufferACEntry(params))
   val s2_pdata = s2_pdata_raw holdUnless s2_valid_pb
 
+  /* There are two sources of the data. One is from [[SinkA]] "Put" message. The other is from [[SinkC]] "ReleaseData" message.
+   * If the request is from A channel, choose data from [[SinkA.io.pb_beat]] else choose data from [[SinkC.io.rel_beat]]
+   */
   s2_pdata_raw.data    := Mux(s2_req.prio(0), io.pb_beat.data, io.rel_beat.data)
   s2_pdata_raw.mask    := Mux(s2_req.prio(0), io.pb_beat.mask, ~UInt(0, width = params.inner.manager.beatBytes))
   s2_pdata_raw.corrupt := Mux(s2_req.prio(0), io.pb_beat.corrupt, io.rel_beat.corrupt)
@@ -171,20 +217,36 @@ class SourceD(params: InclusiveCacheParameters) extends Module
   if (!params.firstLevel)
     params.ccover(io.rel_pop.valid && !io.rel_pop.ready, "SOURCED_2_PUTC_STALL", "Channel C put buffer was not ready in time")
 
+  /** Check if the data are ready at the source. If yes, we are able to fetch. */
   val pb_ready = Mux(s2_req.prio(0), io.pb_pop.ready, io.rel_pop.ready)
+
+  /* If the source of the data is not ready, it means we can not fetch the data at this cycle. */
   when (pb_ready) { s2_valid_pb := Bool(false) }
+
+  /* If the next stage is ready, then this stage is not full. */
   when (s2_valid && s3_ready) { s2_full := Bool(false) }
   when (s2_latch) { s2_valid_pb := s1_need_pb }
+
+  /* If there is a request come from previous stage, then this stage is full, note this will rride previous assign. */
   when (s2_latch) { s2_full := Bool(true) }
 
   params.ccover(s2_valid && !s3_ready, "SOURCED_2_STALL", "Stage 2 pipeline blocked")
 
+  /* If this stage is valid depends on 1 AND 2:
+   *   1. Current stage is full.
+   *   2. Current stage doesn't need data buffer OR the data source is ready.
+   */
   s2_valid := s2_full && (!s2_valid_pb || pb_ready)
+
+  /* If this stage is ready depends on 1 OR 2:
+   *   1. Current stage is not full.
+   *   2. Current stage doesn't need data buffer OR the data source is ready; AND next stage is ready.
+   */
   s2_ready := !s2_full || (s3_ready && (!s2_valid_pb || pb_ready))
 
-  ////////////////////////////////////// STAGE 3 //////////////////////////////////////
-  // Send D response
-
+  /* STAGE 3
+   * Send D response.
+   */
   val s3_latch = s2_valid && s3_ready
   val s3_full = RegInit(Bool(false))
   val s3_valid_d = RegInit(Bool(false))
@@ -200,8 +262,9 @@ class SourceD(params: InclusiveCacheParameters) extends Module
   val s3_need_bs = s3_need_pb
   val s3_acq = s3_req.opcode === AcquireBlock || s3_req.opcode === AcquirePerm
 
-  // Collect s3's data from either the BankedStore or bypass
-  // NOTE: we use the s3_bypass passed down from s1_bypass, because s2-s4 were guarded by the hazard checks and not stale
+  /* Collect s3's data from either the BankedStore or bypass
+   * NOTE: we use the s3_bypass passed down from s1_bypass, because s2-s4 were guarded by the hazard checks and not stale
+   */
   val s3_bypass_data = Wire(UInt())
   def chunk(x: UInt): Seq[UInt] = Seq.tabulate(beatBytes/writeBytes) { i => x((i+1)*writeBytes*8-1, i*writeBytes*8) }
   def chop (x: UInt): Seq[Bool] = Seq.tabulate(beatBytes/writeBytes) { i => x(i) }
@@ -209,14 +272,17 @@ class SourceD(params: InclusiveCacheParameters) extends Module
     (chop(sel) zip (chunk(x) zip chunk(y))) .map { case (s, (x, y)) => Mux(s, x, y) } .asUInt
   val s3_rdata = bypass(s3_bypass, s3_bypass_data, queue.io.deq.bits.data)
 
-  // Lookup table for response codes
+  /** Check if we need to grant without data. */
   val grant = Mux(s3_req.param === BtoT, Grant, GrantData)
+
+  /** Lookup table for response codes */
   val resp_opcode = Vec(Seq(AccessAck, AccessAck, AccessAckData, AccessAckData, AccessAckData, HintAck, grant, Grant))
 
   // No restrictions on the type of buffer used here
   val d = Wire(io.d)
   io.d <> params.micro.innerBuf.d(d)
 
+  /* Here we construct the response TileLink message. */
   d.valid := s3_valid_d
   d.bits.opcode  := Mux(s3_req.prio(0), resp_opcode(s3_req.opcode), ReleaseAck)
   d.bits.param   := Mux(s3_req.prio(0) && s3_acq, Mux(s3_req.param =/= NtoB, toT, toB), UInt(0))
@@ -231,6 +297,7 @@ class SourceD(params: InclusiveCacheParameters) extends Module
   assert (!s3_full || !s3_need_r || queue.io.deq.valid)
 
   when (d.ready) { s3_valid_d := Bool(false) }
+  /* If next stage is ready, then current stage will change to not-full. */
   when (s3_valid && s4_ready) { s3_full := Bool(false) }
   when (s3_latch) { s3_valid_d := s2_need_d }
   when (s3_latch) { s3_full := Bool(true) }
@@ -240,9 +307,10 @@ class SourceD(params: InclusiveCacheParameters) extends Module
   s3_valid := s3_full && (!s3_valid_d || d.ready)
   s3_ready := !s3_full || (s4_ready && (!s3_valid_d || d.ready))
 
-  ////////////////////////////////////// STAGE 4 //////////////////////////////////////
-  // Writeback updated data
-
+  /* STAGE 4
+   * Writeback updated data
+   */
+  /** [[s3_retires]] is from ![[s1_single]], only write request can reach this stage. */
   val s4_latch = s3_valid && s3_retires && s4_ready
   val s4_full = RegInit(Bool(false))
   val s4_beat = RegEnable(s3_beat, s4_latch)
@@ -250,11 +318,14 @@ class SourceD(params: InclusiveCacheParameters) extends Module
   val s4_need_bs = RegEnable(s3_need_bs, s4_latch)
   val s4_need_pb = RegEnable(s3_need_pb, s4_latch)
   val s4_req = RegEnable(s3_req, s4_latch)
+
+  /** Amend opcode for [[atomics]] input. */
   val s4_adjusted_opcode = RegEnable(s3_adjusted_opcode, s4_latch)
   val s4_pdata = RegEnable(s3_pdata, s4_latch)
   val s4_rdata = RegEnable(s3_rdata, s4_latch)
 
   val atomics = Module(new Atomics(params.inner.bundle))
+  /* If the request is release, then we need to update the data inside [[atomics]] */
   atomics.io.write     := s4_req.prio(2)
   atomics.io.a.opcode  := s4_adjusted_opcode
   atomics.io.a.param   := s4_req.param
@@ -288,13 +359,20 @@ class SourceD(params: InclusiveCacheParameters) extends Module
   when (io.bs_wadr.ready || !s4_need_bs) { s4_full := Bool(false) }
   when (s4_latch) { s4_full := Bool(true) }
 
+  /* Whether current request can flow to next stage depends on either one among 1 to 4:
+   *   1. request at stage 3 is a write.
+   *   2. stage 4 is not full.
+   *   3. BS has available request slot.
+   *   4. stage 4 does not need BS, which means the request is a read.
+   */
   s4_ready := !s3_retires || !s4_full || io.bs_wadr.ready || !s4_need_bs
 
-  ////////////////////////////////////// RETIRED //////////////////////////////////////
+  /* RETIRED Stage */
 
-  // Record for bypass the last three retired writebacks
-  // We need 3 slots to collect what was in s2, s3, s4 when the request was in s1
-  // ... you can't rely on s4 being full if bubbles got introduced between s1 and s2
+  /* Record for bypass the last three retired writebacks
+   * We need 3 slots to collect what was in s2, s3, s4 when the request was in s1
+   * ... you can't rely on s4 being full if bubbles got introduced between s1 and s2
+   */
   val retire = s4_full && (io.bs_wadr.ready || !s4_need_bs)
 
   val s5_req  = RegEnable(s4_req,  retire)
@@ -370,6 +448,10 @@ class SourceD(params: InclusiveCacheParameters) extends Module
   // cycle of SourceD falls within the occupancy of the MSHR's plan.
 
   // Must ReleaseData=> be interlocked? RaW hazard
+  /* If SourceC needs to read data from BS and issue ReleaseData to manager e to capacity conflict.
+   * we need to check if there is outstanding ReleaseData from client upon same cache-line,
+   * because ReleaseData has higher priority than AcquireBlock which may trigger an eviction.
+   */
   io.evict_safe :=
     (!busy    || io.evict_req.way =/= s1_req_reg.way || io.evict_req.set =/= s1_req_reg.set) &&
     (!s2_full || io.evict_req.way =/= s2_req.way     || io.evict_req.set =/= s2_req.set) &&
@@ -377,6 +459,9 @@ class SourceD(params: InclusiveCacheParameters) extends Module
     (!s4_full || io.evict_req.way =/= s4_req.way     || io.evict_req.set =/= s4_req.set)
 
   // Must =>GrantData be interlocked? WaR hazard
+  /* If SinkD needs to write data to BS from manager(refill), this is triggered by AcquireBlock originally.
+   * we need to check if there is outstanding Get.
+   */
   io.grant_safe :=
     (!busy    || io.grant_req.way =/= s1_req_reg.way || io.grant_req.set =/= s1_req_reg.set) &&
     (!s2_full || io.grant_req.way =/= s2_req.way     || io.grant_req.set =/= s2_req.set) &&
